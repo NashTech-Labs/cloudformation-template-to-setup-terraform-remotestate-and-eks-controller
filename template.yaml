@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Template for creating EC2 Controller Instance and it's associated resources and S3 bucket and DynamoDB table to hold Terraform state and locks
+Parameters:
+  TerraformStateBucketPrefix:
+    Type: String
+    Default: terraform-state
+    Description: A prefix for S3 bucket name, account id will be added to ensure global uniqueness
+  TerraformStateLockTableName:
+    Type: String
+    Default: terraform-state-locks-dev-eks-v2
+Resources:
+  EKSControllerIamRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      RoleName: dev-eks-v2-controller-r
+      Description: Role for the controller of eks cluster
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "ec2.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      Tags: 
+        - Key: creator
+          Value: aws-devops-automation
+  EKSControllerIamPolicies: 
+    Type: AWS::IAM::Policy
+    Properties: 
+      PolicyName: EKSControllerIamPolicies-p
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: "*"
+            Resource: "*"
+      Roles: 
+        - Ref: "EKSControllerIamRole"
+  EKSControllerIamInstanceProfile: 
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName : EKSControllerIamInstanceProfile-ip
+      Path: "/"
+      Roles: 
+        - Ref: "EKSControllerIamRole"
+  EKSControllerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupName: EKSControllerSecurityGroup-sg
+      GroupDescription: "EKSControllerSecurityGroup"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/8
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+      Tags: 
+        - Key: creator
+          Value: aws-devops-automation
+      VpcId: vpc-00f57ea4efc069113
+  EC2I4AVKQ:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      IamInstanceProfile: EKSControllerIamInstanceProfile-ip
+      ImageId: ami-04505e74c0741db8d
+      InstanceType: t2.medium
+      KeyName: dev-eks-aws-v2-controller
+      SecurityGroupIds:
+        - Ref: 'EKSControllerSecurityGroup'
+      SubnetId: <UPDATE SUBNET VALUE HERE>
+      HttpEndpoint: enabled
+      HttpTokens: required
+      Tags:
+      - Key: Name
+        Value: dev-eks-v2-controller
+      UserData:
+        Fn::Base64: 
+          !Sub |
+            #!/bin/bash
+
+            # Debian / Ubuntu systems
+            apt update -y
+            apt install wget curl unzip -y
+
+            # install Terraform v1.0.9 as terraform109
+            wget https://releases.hashicorp.com/terraform/1.0.9/terraform_1.0.9_linux_amd64.zip
+            unzip terraform_1.0.9_linux_amd64.zip
+            mv terraform terraform109
+            mv terraform109 /usr/local/bin/
+
+            # install awscli v2
+            # https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            ./aws/install
+            rm -rf aws
+            rm awscliv2.zip
+
+            # install helm3 as helm
+            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+            sleep 1s
+
+            # install jq
+            apt-get install jq
+
+            # install kubectl
+            curl -o kubectl https://s3.us-west-2.amazonaws.com/amazon-eks/1.22.6/2022-03-09/bin/linux/amd64/kubectl
+            chmod +x ./kubectl
+            mkdir -p $HOME/bin && cp ./kubectl $HOME/bin/kubectl && export PATH=$PATH:$HOME/bin
+            echo 'export PATH=$PATH:$HOME/bin' >> ~/.bashrc 
+            rm kubectl
+
+            ## .bashrc preferences
+            tee -a /home/ubuntu/.bashrc > /dev/null <<EOT
+            # https://askubuntu.com/a/946716
+            # Show git branch name + terminal coloration
+            force_color_prompt=yes
+            color_prompt=yes
+
+            function parse_git_branch() {
+              git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/(\1)/'
+            }
+            if [ "\$color_prompt" = yes ]; then
+              PS1="\[\e[1;32m\]\u@\h \[\e[34m\]\w \[\033[1;35m\]\\\$(parse_git_branch)\[\e[00m\]$ "
+            else
+              PS1='\$debian_chroot:+(\$debian_chroot)}\u@\h:\w\$(parse_git_branch)\\$ '
+            fi
+            unset color_prompt force_color_prompt
+            EOT
+  TerraformStateS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "dev-eks-v2-${TerraformStateBucketPrefix}"
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  TerraformStateS3BucketBucketPolicy:
+    DependsOn:
+      - TerraformStateS3Bucket
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TerraformStateS3Bucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyDeletingTerraformStateFiles
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:DeleteObject"
+            Resource: !Sub "arn:aws:s3:::${TerraformStateS3Bucket}/*"
+
+  TerraformStateLockDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TerraformStateLockTableName
+      AttributeDefinitions:
+        - AttributeName: LockID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: LockID
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        # Add custom tags as CloudFormation is not able to add these unlike S3
+        - Key: aws-cloudformation-stack-id
+          Value: !Ref "AWS::StackId"
+        - Key: aws-cloudformation-stack-name
+          Value: !Ref "AWS::StackName"
+        - Key: aws-cloudformation-logical-id
+          Value: TerraformStateLockDynamoDBTable
